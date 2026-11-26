@@ -1,8 +1,8 @@
 /*
- * Copyright (c) 2025 Ryan Moeller
+ * Copyright (c) 2025-2026 Ryan Moeller
  *
  * SPDX-License-Identifier: BSD-2-Clause
- */ 
+ */
 
 #include <sys/param.h>
 #include <sys/endian.h>
@@ -60,7 +60,7 @@ static void nbd_scale(struct gctl_req *req, unsigned flags);
 	    "[[-A cacert] -C cert -K key] "
 #endif
 struct g_command class_commands[] = {
-	{ "connect", G_FLAG_LOADKLD, nbd_connect,
+	{ "connect", G_FLAG_VERBOSE | G_FLAG_LOADKLD, nbd_connect,
 	    {
 		{ 'c', "connections", "1", G_TYPE_NUMBER },
 		{ 'n', "name", "", G_TYPE_STRING },
@@ -70,13 +70,13 @@ struct g_command class_commands[] = {
 #endif
 		G_OPT_SENTINEL
 	    },
-	    "[-c num] [-n name] [-p port] "
+	    "[-v] [-c num] [-n name] [-p port] "
 #ifdef WITH_OPENSSL
 	    TLS_USAGE
 #endif
 	    "host"
 	},
-	{ "exports", 0, nbd_list,
+	{ "exports", G_FLAG_VERBOSE, nbd_list,
 	    {
 		{ 'p', "port", NBD_DEFAULT_PORT, G_TYPE_STRING },
 #ifdef WITH_OPENSSL
@@ -84,13 +84,13 @@ struct g_command class_commands[] = {
 #endif
 		G_OPT_SENTINEL
 	    },
-	    "[-p port] "
+	    "[-v] [-p port] "
 #ifdef WITH_OPENSSL
 	    TLS_USAGE
 #endif
 	    "host"
 	},
-	{ "reconnect", 0, nbd_reconnect,
+	{ "reconnect", G_FLAG_VERBOSE, nbd_reconnect,
 	    {
 		{ 'r', "seconds", "0", G_TYPE_NUMBER },
 #ifdef WITH_OPENSSL
@@ -98,13 +98,13 @@ struct g_command class_commands[] = {
 #endif
 		G_OPT_SENTINEL
 	    },
-	    "[-r seconds] "
+	    "[-v] [-r seconds] "
 #ifdef WITH_OPENSSL
 	    TLS_USAGE
 #endif
 	    "prov"
 	},
-	{ "scale", 0, nbd_scale,
+	{ "scale", G_FLAG_VERBOSE, nbd_scale,
 	    {
 		{ 'c', "connections", NULL, G_TYPE_NUMBER },
 #ifdef WITH_OPENSSL
@@ -112,7 +112,7 @@ struct g_command class_commands[] = {
 #endif
 		G_OPT_SENTINEL
 	    },
-	    "-c num "
+	    "[-v] -c num "
 #ifdef WITH_OPENSSL
 	    TLS_USAGE
 #endif
@@ -144,6 +144,7 @@ struct nbd_client {
 	uint32_t maximum_payload;
 	int socket;
 	long tid;
+	bool verbose;
 #ifdef WITH_OPENSSL
 	SSL_CTX *ssl_ctx;
 #endif
@@ -376,11 +377,11 @@ nbd_client_oldstyle_negotiation(struct nbd_client *client)
 	}
 	client->size = handshake.size;
 #define IGNORED_BITS 0xffff0000
-	if ((handshake.flags & IGNORED_BITS) != 0)
-		fprintf(stderr, "Ignoring flags in upper nibble: 0x%08x\n",
+	if (client->verbose && (handshake.flags & IGNORED_BITS) != 0)
+		fprintf(stderr, "Ignoring flags in upper bits: 0x%08x\n",
 		    handshake.flags & IGNORED_BITS);
+	client->transmission_flags = handshake.flags & ~IGNORED_BITS;
 #undef IGNORED_BITS
-	client->handshake_flags = handshake.flags;
 	return (0);
 }
 
@@ -503,6 +504,73 @@ nbd_client_recv_option_reply(struct nbd_client *client,
 	return (0);
 }
 
+static const char *
+nbd_option_error_str(int32_t type)
+{
+	switch (type) {
+	case NBD_REPLY_ERROR_UNSUPPORTED:
+		return ("option not supported");
+	case NBD_REPLY_ERROR_POLICY:
+		return ("forbidden by server policy");
+	case NBD_REPLY_ERROR_INVALID:
+		return ("invalid option");
+	case NBD_REPLY_ERROR_PLATFORM:
+		return ("not supported on server platform");
+	case NBD_REPLY_ERROR_TLS_REQUIRED:
+		return ("TLS required");
+	case NBD_REPLY_ERROR_UNKNOWN:
+		return ("unknown export");
+	case NBD_REPLY_ERROR_SHUTDOWN:
+		return ("server shutting down");
+	case NBD_REPLY_ERROR_BLOCK_SIZE_REQD:
+		return ("block size constraints required");
+	default:
+		return (NULL);
+	}
+}
+
+/*
+ * Receive the optional message following an option error reply and report
+ * the error as "<what> failed".  If unsup_ok is set, an unsupported option
+ * is not treated as an error: the message is discarded and 0 is returned so
+ * the caller can fall back.  Otherwise returns -1.
+ */
+static int
+nbd_client_recv_option_error(struct nbd_client *client,
+    const struct nbd_option_reply *reply, const char *what, bool unsup_ok)
+{
+	char codebuf[sizeof("error 0xffffffff")];
+	const char *errstr;
+	char *msg = NULL;
+
+	assert((reply->type & NBD_REPLY_ERROR) != 0);
+	if (reply->length > 0) {
+		msg = malloc(reply->length);
+		assert(msg != NULL);
+		if (nbd_client_recv(client, msg, reply->length) != 0) {
+			free(msg);
+			return (-1);
+		}
+	}
+	if (unsup_ok && reply->type == NBD_REPLY_ERROR_UNSUPPORTED) {
+		free(msg);
+		return (0);
+	}
+	errstr = nbd_option_error_str(reply->type);
+	if (errstr == NULL) {
+		snprintf(codebuf, sizeof(codebuf), "error %#x",
+		    (uint32_t)reply->type);
+		errstr = codebuf;
+	}
+	if (msg != NULL)
+		gctl_error(client->req, "%s failed: %s: %.*s", what, errstr,
+		    (int)reply->length, msg);
+	else
+		gctl_error(client->req, "%s failed: %s", what, errstr);
+	free(msg);
+	return (-1);
+}
+
 #ifdef WITH_OPENSSL
 static int
 nbd_client_starttls(struct nbd_client *client)
@@ -516,13 +584,15 @@ nbd_client_starttls(struct nbd_client *client)
 	if (nbd_client_recv_option_reply(client, &reply, NBD_OPTION_STARTTLS)
 	    != 0)
 		return (-1);
+	if ((reply.type & NBD_REPLY_ERROR) != 0)
+		return (nbd_client_recv_option_error(client, &reply,
+		    "TLS negotiation", false));
 	if (reply.type != NBD_REPLY_ACK) {
 		gctl_error(req, "Failed to negotiate TLS.");
 		return (-1);
 	}
 	ssl = SSL_new(client->ssl_ctx);
 	if (ssl == NULL) {
-		/* TODO: verbose flag */
 		ERR_print_errors_fp(stderr);
 		gctl_error(req, "Failed to create TLS connection.");
 		return (-1);
@@ -641,30 +711,10 @@ nbd_client_negotiate_options(struct nbd_client *client, bool first)
 			return (0);
 		}
 		if ((reply.type & NBD_REPLY_ERROR) != 0) {
-			if (reply.length > 0) {
-				buf = malloc(reply.length);
-				assert(buf != NULL);
-				if (nbd_client_recv(client, buf, reply.length)
-				    != 0)
-					return (-1);
-				switch (reply.type) {
-				case NBD_REPLY_ERROR_UNSUPPORTED:
-				case NBD_REPLY_ERROR_TLS_REQUIRED:
-					break;
-				default:
-					gctl_error(req,
-					    "Negotiation failed: %.*s",
-					    reply.length, buf);
-					break;
-				}
-				free(buf);
-			}
-			if (reply.type == NBD_REPLY_ERROR_TLS_REQUIRED)
-				gctl_error(req, "Negotiation failed: "
-				    "TLS required for this export");
-			if (reply.type == NBD_REPLY_ERROR_UNSUPPORTED)
-				return (nbd_client_negotiate_fallback(client));
-			return (-1);
+			if (nbd_client_recv_option_error(client, &reply,
+			    "Negotiation", true) != 0)
+				return (-1);
+			return (nbd_client_negotiate_fallback(client));
 		}
 		if (reply.type != NBD_REPLY_INFO) {
 			gctl_error(req, "Unexpected option reply type.");
@@ -740,7 +790,6 @@ nbd_client_negotiate(struct nbd_client *client, bool first)
 {
 	struct nbd_handshake handshake;
 	struct gctl_req *req = client->req;
-	ssize_t len;
 
 	if (nbd_client_recv(client, &handshake, sizeof(handshake)) != 0)
 		return (-1);
@@ -833,15 +882,11 @@ issue(struct gctl_req *req)
 	return (0);
 }
 
-/*
- * TODO: verbose output
- */
 static void
 nbd_connect(struct gctl_req *req, unsigned flags)
 {
 	char provider[PATH_MAX];
 	struct nbd_client client = {};
-	const char *name;
 	int *sockets = NULL;
 	intmax_t nconns;
 	int nargs;
@@ -858,6 +903,7 @@ nbd_connect(struct gctl_req *req, unsigned flags)
 		return;
 	}
 	client.req = req;
+	client.verbose = (flags & G_FLAG_VERBOSE) != 0;
 	client.host = gctl_get_ascii(req, "arg0");
 	client.port = gctl_get_ascii(req, "port");
 #ifdef WITH_OPENSSL
@@ -921,8 +967,6 @@ nbd_client_list(struct nbd_client *client, nbd_client_list_cb cb, void *ctx)
 	struct gctl_req *req = client->req;
 	char *name, *description;
 	size_t resid;
-	ssize_t len;
-	int s = client->socket;
 
 	if (nbd_client_recv(client, &handshake, sizeof(handshake)) != 0)
 		return (-1);
@@ -953,24 +997,9 @@ nbd_client_list(struct nbd_client *client, nbd_client_list_cb cb, void *ctx)
 			return (-1);
 		if (reply.type == NBD_REPLY_ACK)
 			break;
-		if ((reply.type & NBD_REPLY_ERROR) != 0) {
-			if (reply.length == 0)
-				gctl_error(req, "Listing exports failed (%d)",
-				    reply.type);
-			else {
-				uint8_t *buf;
-
-				buf = malloc(reply.length);
-				assert(buf != NULL);
-				if (nbd_client_recv(client, buf, reply.length)
-				    != 0)
-					return (-1);
-				gctl_error(req, "Listing exports failed: %.*s",
-				    reply.length, buf);
-				free(buf);
-			}
-			return (-1);
-		}
+		if ((reply.type & NBD_REPLY_ERROR) != 0)
+			return (nbd_client_recv_option_error(client, &reply,
+			    "Listing exports", false));
 		if (reply.type != NBD_REPLY_SERVER) {
 			gctl_error(req, "Unexpected option reply type.");
 			return (-1);
@@ -1034,7 +1063,6 @@ static int
 nbd_client_abort(struct nbd_client *client)
 {
 	struct nbd_option_reply reply;
-	struct nbd_option_reply_server server_export;
 	struct gctl_req *req = client->req;
 
 	if (nbd_client_send_option(client, NBD_OPTION_ABORT, NULL, 0) != 0)
@@ -1043,23 +1071,9 @@ nbd_client_abort(struct nbd_client *client)
 		return (-1);
 	if (reply.type == NBD_REPLY_ACK)
 		return (0);
-	if ((reply.type & NBD_REPLY_ERROR) != 0) {
-		if (reply.length == 0)
-			gctl_error(req, "Abort option failed (%d)", reply.type);
-		else {
-			uint8_t *buf;
-
-			buf = malloc(reply.length);
-			assert(buf != NULL);
-			if (nbd_client_recv(client, buf, reply.length)
-			    != 0)
-				return (-1);
-			gctl_error(req, "Abort option failed: %.*s",
-			    reply.length, buf);
-			free(buf);
-		}
-		return (-1);
-	}
+	if ((reply.type & NBD_REPLY_ERROR) != 0)
+		return (nbd_client_recv_option_error(client, &reply,
+		    "Abort option", false));
 	gctl_error(req, "Unexpected option reply type.");
 	return (-1);
 }
@@ -1082,6 +1096,7 @@ nbd_list(struct gctl_req *req, unsigned flags)
 		return;
 	}
 	client.req = req;
+	client.verbose = (flags & G_FLAG_VERBOSE) != 0;
 	client.host = gctl_get_ascii(req, "arg0");
 	client.port = gctl_get_ascii(req, "port");
 #ifdef WITH_OPENSSL
@@ -1154,7 +1169,7 @@ find_config(struct ggeom *gp, const char *name)
 }
 
 static void
-scale_common(struct gctl_req *req, bool reconnect)
+scale_common(struct gctl_req *req, unsigned flags, bool reconnect)
 {
 	struct nbd_client client = {};
 	struct gmesh mesh;
@@ -1246,6 +1261,7 @@ scale_common(struct gctl_req *req, bool reconnect)
 	nsockets = nconns - nactive;
 	assert(nsockets > 0);
 	client.req = req;
+	client.verbose = (flags & G_FLAG_VERBOSE) != 0;
 	client.host = find_config(gp, "Host");
 	if (client.host == NULL) {
 		gctl_error(req, "Invalid config (missing Host).");
@@ -1307,11 +1323,11 @@ free:
 static void
 nbd_reconnect(struct gctl_req *req, unsigned flags)
 {
-	scale_common(req, true);
+	scale_common(req, flags, true);
 }
 
 static void
 nbd_scale(struct gctl_req *req, unsigned flags)
 {
-	scale_common(req, false);
+	scale_common(req, flags, false);
 }

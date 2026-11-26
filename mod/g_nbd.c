@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025 Ryan Moeller
+ * Copyright (c) 2025-2026 Ryan Moeller
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
@@ -69,9 +69,10 @@ SYSCTL_INT(_kern_geom_nbd, OID_AUTO, debug, CTLFLAG_RWTUN, &g_nbd_debug, 0,
 
 #define KTR_NBD KTR_SPARE4
 
-static uint32_t maxpayload = 1 << 25;
+#define G_NBD_DEFAULT_MAXPAYLOAD (1 << 25)
+static uint32_t maxpayload = G_NBD_DEFAULT_MAXPAYLOAD;
 SYSCTL_U32(_kern_geom_nbd, OID_AUTO, maxpayload, CTLFLAG_RWTUN, &maxpayload, 0,
-    "Default maximum payload size");
+    "Maximum payload size (0 for no limit beyond the server's)");
 static u_long sendspace = 1536 * 1024;
 SYSCTL_ULONG(_kern_geom_nbd, OID_AUTO, sendspace, CTLFLAG_RWTUN, &sendspace, 0,
     "Default socket send buffer size");
@@ -153,7 +154,7 @@ struct g_nbd_softc {
 	SLIST_HEAD(, nbd_conn)	sc_connections;
 	u_int		sc_nconns;
 	u_int		sc_nactive;
-	struct mtx	sc_conns_mtx;
+	struct sx	sc_conns_lock;
 	bool		sc_flushing;
 	struct sx	sc_flush_lock;
 };
@@ -428,21 +429,21 @@ nbd_write_mbufs(struct bio *bp, bool tls, size_t limit, size_t *offset)
 	    nbd_inflight_get_cookie(bp), tls ? "tls" : "notls", limit, start);
 	if ((bp->bio_flags & BIO_UNMAPPED) != 0) {
 		struct mbuf *d, *m_tail;
-		size_t page_offset = start == 0 ? bp->bio_ma_offset : 0;
-		size_t resid = bp->bio_length;
+		size_t abs = start + bp->bio_ma_offset;
+		size_t page_offset = abs & PAGE_MASK;
+		size_t resid = bp->bio_length - start;
 		size_t len;
 
 		CTR3(KTR_NBD, "%s cookie=%lu unmapped write (%s)", __func__,
 		    nbd_inflight_get_cookie(bp), tls ? "tls" : "notls");
 		if (resid > limit) {
 			/* Reduce limit to end on a page boundary. */
-			resid = trunc_page(limit - page_offset) + page_offset;
+			resid = trunc_page(page_offset + limit) - page_offset;
 			counter_u64_add(g_nbd_write_truncs, 1);
 		}
 		*offset += resid;
 		m = m_tail = d = NULL;
-		for (int i = OFF_TO_IDX(start + page_offset);
-		    resid > 0; i++) {
+		for (int i = OFF_TO_IDX(abs); resid > 0; i++) {
 			if (d == NULL) {
 				d = mb_alloc_ext_pgs(M_NOWAIT,
 #if __FreeBSD_version > 1500026
@@ -932,8 +933,8 @@ nbd_conn_recv(struct nbd_conn *nc)
 			    __func__, nc, nbd_inflight_get_cookie(bp));
 			if ((bp->bio_flags & BIO_UNMAPPED) != 0) {
 				char *vaddr;
-				size_t page_offset =
-				    offset == 0 ? bp->bio_ma_offset : 0;
+				size_t abs = offset + bp->bio_ma_offset;
+				size_t page_offset = abs & PAGE_MASK;
 				size_t offset1 = 0;
 				size_t resid1 = len;
 				size_t len1;
@@ -941,8 +942,7 @@ nbd_conn_recv(struct nbd_conn *nc)
 				CTR3(KTR_NBD,
 				    "%s nc=%p cookie=%lu unmapped read",
 				    __func__, nc, nbd_inflight_get_cookie(bp));
-				for (int i = OFF_TO_IDX(offset + page_offset);
-				    resid1 > 0; i++) {
+				for (int i = OFF_TO_IDX(abs); resid1 > 0; i++) {
 					len1 = MIN(resid1,
 					    PAGE_SIZE - page_offset);
 					MPASS(i < bp->bio_ma_n);
@@ -976,7 +976,7 @@ g_nbd_flush_wait(struct g_nbd_softc *sc)
 	struct bio *bp;
 
 	CTR2(KTR_NBD, "%s sc=%p", __func__, sc);
-	mtx_lock(&sc->sc_conns_mtx);
+	sx_slock(&sc->sc_conns_lock);
 	atomic_store_bool(&sc->sc_flushing, true);
 	SLIST_FOREACH(nc, &sc->sc_connections, nc_connections) {
 		mtx_lock(&nc->nc_inflight_mtx);
@@ -995,7 +995,7 @@ restart:
 		mtx_unlock(&nc->nc_inflight_mtx);
 	}
 	atomic_store_bool(&sc->sc_flushing, false);
-	mtx_unlock(&sc->sc_conns_mtx);
+	sx_sunlock(&sc->sc_conns_lock);
 }
 
 static inline bool
@@ -1152,10 +1152,10 @@ g_nbd_remove_conn(struct g_nbd_softc *sc, struct nbd_conn *nc)
 
 	CTR3(KTR_NBD, "%s sc=%p nc=%p", __func__, sc, nc);
 
-	mtx_lock(&sc->sc_conns_mtx);
+	sx_xlock(&sc->sc_conns_lock);
 	SLIST_REMOVE(&sc->sc_connections, nc, nbd_conn, nc_connections);
 	last = --sc->sc_nactive == 0;
-	mtx_unlock(&sc->sc_conns_mtx);
+	sx_xunlock(&sc->sc_conns_lock);
 	if (last)
 		wakeup(&sc->sc_nactive);
 
@@ -1346,10 +1346,10 @@ g_nbd_add_conn(struct g_nbd_softc *sc, struct socket *so, const char *name,
 	cv_init(&nc->nc_receive_cv, "gnbd:receive");
 	sema_init(&nc->nc_receiver_done, 0, "gnbd:receiver_done");
 
-	mtx_lock(&sc->sc_conns_mtx);
+	sx_xlock(&sc->sc_conns_lock);
 	SLIST_INSERT_HEAD(&sc->sc_connections, nc, nc_connections);
 	sc->sc_nactive++;
-	mtx_unlock(&sc->sc_conns_mtx);
+	sx_xunlock(&sc->sc_conns_lock);
 
 	SOCK_SENDBUF_LOCK(so);
 	so->so_snd.sb_lowat = so->so_snd.sb_hiwat + 1;
@@ -1510,8 +1510,26 @@ g_nbd_ctl_connect(struct gctl_req *req, struct g_class *mp)
 		return;
 	}
 	host = gctl_get_asciiparam(req, "host");
+	if (host == NULL) {
+		g_destroy_geom(gp);
+		free_unr(g_nbd_unit, unit);
+		gctl_error(req, "No 'host' argument.");
+		return;
+	}
 	port = gctl_get_asciiparam(req, "port");
+	if (port == NULL) {
+		g_destroy_geom(gp);
+		free_unr(g_nbd_unit, unit);
+		gctl_error(req, "No 'port' argument.");
+		return;
+	}
 	name = gctl_get_asciiparam(req, "name");
+	if (name == NULL) {
+		g_destroy_geom(gp);
+		free_unr(g_nbd_unit, unit);
+		gctl_error(req, "No 'name' argument.");
+		return;
+	}
 	description = gctl_get_asciiparam(req, "description");
 	sizep = gctl_get_paraml(req, "size", sizeof(*sizep));
 	if (sizep == NULL) {
@@ -1590,9 +1608,27 @@ g_nbd_ctl_connect(struct gctl_req *req, struct g_class *mp)
 		return;
 	}
 	maxpl = *maxpayloadp;
-	maxpl = MIN(maxpl, maxpayload);
-	if (maxpl == 0 /* unset */)
-		maxpl = maxpayload; /* tunable default */
+	/* 0 means no limit from the server or the tunable. */
+	if (maxpayload != 0 && (maxpl == 0 || maxpl > maxpayload))
+		maxpl = maxpayload;
+	if (maxpl == 0)
+		maxpl = G_NBD_DEFAULT_MAXPAYLOAD;
+	/*
+	 * The maximum payload need not be a multiple of the block size or the
+	 * page size.  Split requests on page boundaries where possible, and
+	 * never partway through a block.
+	 */
+	if (maxpl >= PAGE_SIZE)
+		maxpl = rounddown(maxpl, MAX(minbs, PAGE_SIZE));
+	else
+		maxpl = rounddown(maxpl, minbs);
+	if (maxpl == 0) {
+		g_destroy_geom(gp);
+		free_unr(g_nbd_unit, unit);
+		gctl_error(req, "Maximum payload smaller than minimum block "
+		    "size.");
+		return;
+	}
 	/*
 	 * Ensure minimum default sendspace/recvspace sizes can fit the minimum
 	 * block size.  Actual sizes should be much higher (up to sbsize).
@@ -1668,7 +1704,7 @@ g_nbd_ctl_connect(struct gctl_req *req, struct g_class *mp)
 	bio_queue_init(&sc->sc_queue);
 	mtx_init(&sc->sc_queue_mtx, "gnbd:queue", NULL, MTX_DEF);
 	SLIST_INIT(&sc->sc_connections);
-	mtx_init(&sc->sc_conns_mtx, "gnbd:connections", NULL, MTX_DEF);
+	sx_init(&sc->sc_conns_lock, "gnbd:connections");
 	sx_init(&sc->sc_flush_lock, "gnbd:flush");
 	gp->softc = sc;
 	pp = g_new_providerf(gp, "%s", gp->name);
@@ -1746,10 +1782,10 @@ g_nbd_ctl_scale(struct gctl_req *req, struct g_class *mp)
 		gctl_error(req, "Server doesn't support multiple connections.");
 		return;
 	}
-	mtx_lock(&sc->sc_conns_mtx);
+	sx_xlock(&sc->sc_conns_lock);
 	sc->sc_nconns = nconns;
 	if (sc->sc_nactive == nconns) {
-		mtx_unlock(&sc->sc_conns_mtx);
+		sx_xunlock(&sc->sc_conns_lock);
 		return;
 	}
 	if (sc->sc_nactive > nconns) {
@@ -1761,12 +1797,12 @@ g_nbd_ctl_scale(struct gctl_req *req, struct g_class *mp)
 			if (--n == nconns)
 				break;
 		}
-		mtx_unlock(&sc->sc_conns_mtx);
+		sx_xunlock(&sc->sc_conns_lock);
 		wakeup(&sc->sc_queue);
 		/* The sender threads will take care of the cleanup. */
 		return;
 	}
-	mtx_unlock(&sc->sc_conns_mtx);
+	sx_xunlock(&sc->sc_conns_lock);
 	nsocketsp = gctl_get_paraml(req, "nsockets", sizeof(nsockets));
 	if (nsocketsp == NULL) {
 		gctl_error(req, "No 'nsockets' argument.");
@@ -1811,7 +1847,7 @@ g_nbd_free(struct g_nbd_softc *sc)
 	g_wither_geom(sc->sc_geom, ENXIO);
 	free_unr(g_nbd_unit, sc->sc_unit);
 	sx_destroy(&sc->sc_flush_lock);
-	mtx_destroy(&sc->sc_conns_mtx);
+	sx_destroy(&sc->sc_conns_lock);
 	mtx_destroy(&sc->sc_queue_mtx);
 	g_free(__DECONST(char *, sc->sc_description));
 	g_free(__DECONST(char *, sc->sc_name));
@@ -1836,15 +1872,15 @@ g_nbd_destroy(struct g_nbd_softc *sc)
 	 */
 	g_topology_unlock();
 	g_wither_provider(sc->sc_provider, ENXIO);
-	mtx_lock(&sc->sc_conns_mtx);
+	sx_xlock(&sc->sc_conns_lock);
 	sc->sc_nconns = 0;
 	SLIST_FOREACH(nc, &sc->sc_connections, nc_connections)
 		nbd_conn_degrade_state(nc, NBD_CONN_SOFT_DISCONNECTING);
 	wakeup(&sc->sc_queue);
 	while (sc->sc_nactive > 0)
-		mtx_sleep(&sc->sc_nactive, &sc->sc_conns_mtx, PRIBIO,
+		sx_sleep(&sc->sc_nactive, &sc->sc_conns_lock, PRIBIO,
 		    "gnbd:destroy", 0);
-	mtx_unlock(&sc->sc_conns_mtx);
+	sx_xunlock(&sc->sc_conns_lock);
 	g_nbd_drain_queue(sc);
 	/*
 	 * Must return with topology_lock held and g_nbd_free() needs it for
@@ -2000,10 +2036,12 @@ g_nbd_advance(struct bio *bp, off_t offset)
 	bp->bio_offset += offset;
 	bp->bio_length -= offset;
 	if ((bp->bio_flags & BIO_UNMAPPED) != 0) {
-		bp->bio_ma += offset / PAGE_SIZE;
-		bp->bio_ma_offset += offset;
-		bp->bio_ma_offset %= PAGE_SIZE;
-		bp->bio_ma_n -= offset / PAGE_SIZE;
+		off_t abs = bp->bio_ma_offset + offset;
+
+		bp->bio_ma += abs / PAGE_SIZE;
+		bp->bio_ma_offset = abs % PAGE_SIZE;
+		bp->bio_ma_n = howmany(bp->bio_ma_offset + bp->bio_length,
+		    PAGE_SIZE);
 	} else {
 		bp->bio_data += offset;
 	}
